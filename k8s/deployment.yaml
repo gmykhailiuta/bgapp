@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bgapp-${ROLE}
+  labels: {}
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: bgapp
+      role: ${ROLE}
+      env: test
+  template:
+    metadata:
+      labels:
+        app: bgapp
+        role: ${ROLE}
+        env: test
+    spec:
+      containers:
+        - name: bgapp-${ROLE}
+          image: bgapp:${VERSION}
+          imagePullPolicy: Never
+          env:
+          - name: VERSION
+            value: "${VERSION}"
+          - name: COLOR
+            value: "${ROLE}"
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthcheck
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /healthcheck
+              port: http

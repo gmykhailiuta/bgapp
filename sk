@@ -1,0 +1,164 @@
+#!/bin/sh
+export ROLE=${ROLE:-green}
+export VERSION=${VERSION:-latest}
+
+# DEVELOPMENT
+
+clean() {
+    find . | grep -E "(__pycache__|\.pyc|\.pyo\$)" | xargs rm -rf
+    rm -rf .pytest_cache
+}
+
+init_venv() {
+    python3 -m venv .venv
+    .venv/bin/pip3 install -r requirements/test.txt
+}
+
+run_dev() {
+    .venv/bin/python3 main.py
+}
+
+run_gunicorn() {
+    .venv/bin/gunicorn --workers 1 \
+    --bind 0.0.0.0:8000 \
+    --access-logfile=- \
+    --error-logfile=- \
+    main:bgapp
+}
+
+build() {
+    clean
+    docker build -t bgapp:${VERSION} \
+        --build-arg=VERSION="${VERSION}" .
+}
+
+run_docker() {
+    docker run -p 8000:8000 bgapp:${VERSION}
+}
+
+test_docker() {
+    .venv/bin/pytest
+}
+
+# DEPLOYMENT TO DOCKER-COMPOSE
+
+dc_deploy_all() {
+    docker-compose up -d
+}
+
+dc_deploy() {
+    ROLE=${1:-$ROLE}
+    docker-compose up app-${ROLE} -d --force-recreate
+}
+
+dc_get_public_url() {
+    docker-compose port nginx 8000
+}
+
+dc_switch() {
+    ROLE=${1:-$ROLE}
+    cat nginx/app.conf.template | envsubst '$ROLE' > nginx/app.conf
+    docker-compose exec nginx /bin/sh -c 'nginx -s reload'
+    _wait_for_role "$(dc_get_public_url)" "${ROLE}"
+}
+
+dc_role_blink() {
+    role=green
+    while true; do
+        role=$(_flip_role ${role})
+        dc_switch "${role}"
+        sleep 1
+    done
+}
+
+# DEPLOYMENT TO (MINI)KUBE(RNETES)
+
+mk_init() {
+    minikube start --kubernetes-version 1.22.4 --vm-driver=virtualbox
+}
+
+mk_deploy_service() {
+    cat ./k8s/public-service.yaml | \
+        envsubst '$ROLE:$VERSION' | \
+        kubectl apply -o json -f -
+}
+
+mk_deploy_deployment() {
+    cat ./k8s/deployment.yaml | \
+        envsubst '$ROLE:$VERSION' | \
+        kubectl apply -o json -f -
+}
+
+mk_switch() {
+    ROLE=${1:-$ROLE}
+    mk_deploy_service
+    _wait_for_role "$(mk_get_public_url)" "${ROLE}"
+}
+
+mk_role_blink() {
+    role=green
+    while true; do
+        role=$(_flip_role ${role})
+        mk_switch "${role}"
+        sleep 1
+    done
+}
+
+mk_deploy_all() {
+    ROLE=green mk_deploy_service
+    ROLE=green mk_deploy_deployment
+    ROLE=blue mk_deploy_deployment
+}
+
+mk_get_public_url() {
+    NODE_PORT=$(kubectl get \
+        -o jsonpath="{.spec.ports[0].nodePort}" services bgapp)
+    NODE_IP=$(kubectl get nodes \
+        -o jsonpath="{.items[0].status.addresses[0].address}")
+    echo "http://${NODE_IP}:${NODE_PORT}"
+}
+
+# BENCHMARK TESTING
+
+dc_test_ab() {
+    ab -c 1 -n 9999  -v 1 $(dc_get_public_url)/api/
+}
+
+mk_test_ab() {
+    ab -c 1 -n 9999  -v 1 $(mk_get_public_url)/api/
+}
+
+# HELPERS
+
+_flip_role() {
+    ROLE=${1:-$ROLE}
+    if [ "${role}" = "green" ]; then
+        echo "blue"
+    else
+        echo "green"
+    fi
+}
+
+_wait_for_role() {
+    URL=${1}
+    ROLE=${2:-$ROLE}
+    while [ "$(curl -s ${URL}/api | jq -r '.color' &>/dev/null)" != "$ROLE" ]; do
+        echo -n '.'
+        sleep 0.5
+    done
+    echo "Switched to ${ROLE}.."
+}
+
+set +x
+if [ "$1" != "" ]; then
+    command="$(printf "$1"|tr '-' '_')"
+    shift
+else command="default"; fi
+if (type "$command" >/dev/null 2>&1) && \
+        [ "$(printf "$command" | cut -c -1)" != "_" ]; then
+    [ -n "$DEBUG" ] && set -x
+    $command "$@"
+else
+    printf 'Command %s not found\n' "$command"
+    exit 1
+fi
